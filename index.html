@@ -369,6 +369,13 @@ label.fileb{cursor:pointer}
               <label class="small"><input type="checkbox" id="audition"> Sound on entry</label>
             </div>
 
+            <div class="tbar" id="findTab">
+              <span class="small">Find a tab for this song:</span>
+              <a class="btn sm" id="ugLink" target="_blank" rel="noopener noreferrer">Ultimate Guitar &#8599;</a>
+              <a class="btn sm" id="ssLink" target="_blank" rel="noopener noreferrer">Songsterr &#8599;</a>
+              <button class="btn sm primary" id="pasteClip" type="button">Paste tab from clipboard</button>
+            </div>
+
             <div id="selBar" class="selbar" hidden>
               <span id="selTxt"></span>
               <button class="btn sm primary" data-sa="learn" type="button">Mark learned</button>
@@ -515,8 +522,10 @@ function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'');}catch(e)
 function ytId(u){var m=String(u||'').match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/|live\/))([\w-]{11})/);return m?m[1]:null;}
 function platform(h){if(/youtu/.test(h))return 'YouTube';if(/instagram/.test(h))return 'Instagram';if(/tiktok/.test(h))return 'TikTok';if(/facebook|fb\./.test(h))return 'Facebook';if(/twitter|^x\.com/.test(h))return 'X';return h||'Link';}
 function autoTitle(url){
-  var id=ytId(url);if(!id)return Promise.resolve('');
-  return fetch('https://www.youtube.com/oembed?format=json&url='+encodeURIComponent(url)).then(function(r){return r.ok?r.json():{};}).then(function(j){return j.title||'';}).catch(function(){return '';});
+  var id=ytId(url),none={title:'',artist:''};if(!id)return Promise.resolve(none);
+  return fetch('https://www.youtube.com/oembed?format=json&url='+encodeURIComponent(url)).then(function(r){return r.ok?r.json():{};}).then(function(j){
+    return {title:j.title||'',artist:(j.author_name||'').replace(/\s*-\s*Topic$/i,'').replace(/VEVO$/i,'').trim()};
+  }).catch(function(){return none;});
 }
 
 /* ---------- progress ---------- */
@@ -744,7 +753,8 @@ function openSong(s){
   $('#sTitle').value=s.title;$('#sArtist').value=s.artist;$('#sStatus').value=s.status;$('#sNotes').value=s.notes;
   $('#bpm').value=s.bpm;$('#dSwing').value=s.swing;
   s.last=Date.now();
-  syncToggles();renderPlayer();renderDrums();renderLab();renderTab();loopNote();afterEdit();
+  syncToggles();renderPlayer();renderDrums();renderLab();renderTab();loopNote();afterEdit();updateFind();
+  if(!s.artist&&ytId(s.url))autoTitle(s.url).then(function(i){if(cur&&cur.id===s.id&&!cur.artist&&i.artist){cur.artist=i.artist;$('#sArtist').value=i.artist;save();updateFind();}});
   $('#aName').textContent='No audio yet';$('#aPlay').disabled=true;$('#aSeek').disabled=true;$('#aDrop').hidden=true;
   resetGen();A.removeAttribute('src');ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');
   hStatus('');
@@ -939,6 +949,21 @@ function tabIO(a){
   pushUndo(true);
   if(a==='replace')cur.cols=cols;else cur.cols=cur.cols.concat(cols);
   cursor={c:0,s:0};selR=null;loop=null;loopNote();renderTab();afterEdit();toast('Tab loaded: '+cols.length+' columns.');
+}
+function updateFind(){
+  if(!cur)return;
+  var e=encodeURIComponent(((cur.artist||'')+' '+(cur.title||'')).trim());
+  $('#ugLink').href='https://www.ultimate-guitar.com/search.php?search_type=title&value='+e;
+  $('#ssLink').href='https://www.songsterr.com/?pattern='+e;
+}
+async function pasteClip(){
+  var t='';
+  try{t=await navigator.clipboard.readText();}
+  catch(e){$('#tabIO').hidden=false;$('#tioText').focus();toast('This browser would not share the clipboard. Paste the tab into the box instead.');return;}
+  var cols=parseTab(t);
+  if(!cols){toast('No six-line tab found on the clipboard. Copy the tab text from the page first.');return;}
+  pushUndo(true);cur.cols=cols;cursor={c:0,s:0};selR=null;loop=null;loopNote();renderTab();afterEdit();
+  toast('Tab loaded: '+cols.length+' columns. Ctrl+Z brings back the old one.');
 }
 function copyText(t){
   var ok=function(){toast('Copied.');};
@@ -1602,13 +1627,14 @@ function bind(){
     e.preventDefault();
     var url=$('#addUrl').value,title=$('#addTitle').value.trim(),artist=$('#addArtist').value.trim();
     var btn=e.target.querySelector('button');btn.disabled=true;
-    var done=function(t){
+    var done=function(t,chan){
       var sp=splitTitle(t,artist);
+      if(!sp[1]&&chan)sp[1]=chan;
       addSong(url,sp[0],sp[1]);
       $('#addUrl').value='';$('#addTitle').value='';$('#addArtist').value='';
       btn.disabled=false;renderLibrary();toast('Added to Want to learn.');
     };
-    if(!title&&ytId(normUrl(url)))autoTitle(normUrl(url)).then(done);else done(title);
+    if(!title&&ytId(normUrl(url)))autoTitle(normUrl(url)).then(function(i){done(i.title,i.artist);});else done(title);
   });
   $('#board').addEventListener('click',function(e){
     var mv=e.target.closest('[data-move]');
@@ -1631,8 +1657,8 @@ function bind(){
 
   // song header
   $('#back').addEventListener('click',function(){go('');});
-  $('#sTitle').addEventListener('input',function(e){cur.title=e.target.value;document.title=(cur.title||'Song')+' | Woodshed';save();});
-  $('#sArtist').addEventListener('input',function(e){cur.artist=e.target.value;save();});
+  $('#sTitle').addEventListener('input',function(e){cur.title=e.target.value;document.title=(cur.title||'Song')+' | Woodshed';save();updateFind();});
+  $('#sArtist').addEventListener('input',function(e){cur.artist=e.target.value;save();updateFind();});
   $('#sStatus').addEventListener('change',function(e){cur.status=e.target.value;save();});
   $('#sNotes').addEventListener('input',function(e){cur.notes=e.target.value;save();});
   var delT=0;
@@ -1685,6 +1711,7 @@ function bind(){
   $('#aFocus').addEventListener('change',function(){wireA();applyFocus();});
   $('#aRec').addEventListener('click',recToggle);
   $('#aLink').addEventListener('click',function(){helperFetch(false);});
+  $('#pasteClip').addEventListener('click',pasteClip);
   $('#autoFetch').addEventListener('change',function(e){db.prefs.autoFetch=e.target.checked;save();});
   $('#aDrop').addEventListener('click',function(){
     audioDel(cur.id);stopA();resetGen();A.removeAttribute('src');
