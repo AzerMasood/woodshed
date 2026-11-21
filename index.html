@@ -192,13 +192,18 @@ label.fileb{cursor:pointer}
 .gen .seg{align-self:flex-start}
 .gen .mono{white-space:pre-wrap}
 .gbar{height:8px}
+.workspace.narrow{grid-template-columns:minmax(0,230px) minmax(0,1fr)}
+.workspace.narrow .panel>header h2{font-size:14px}
+.webview iframe{width:100%;height:min(66vh,720px);min-height:420px;border:1px solid var(--line);border-radius:10px;background:#fff;display:block}
+#pTab:not(.webmode) .webview{display:none}
+#pTab.webmode #tabScroll,#pTab.webmode #editBar,#pTab.webmode #padBox,#pTab.webmode #selBar,#pTab.webmode #tabIO,#pTab.webmode .tabhint{display:none!important}
 .seg.wrap{flex-wrap:wrap}
 .seg.wrap button{flex:none}
 #toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:var(--panel-2);border:1px solid var(--line-2);border-radius:10px;padding:9px 14px;opacity:0;pointer-events:none;transition:.2s;z-index:50;max-width:90vw}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 
 @media (max-width:1000px){
-  .workspace{grid-template-columns:minmax(0,1fr)}
+  .workspace,.workspace.narrow{grid-template-columns:minmax(0,1fr)}
   .main{order:-1}
   .board{grid-template-columns:minmax(0,1fr)}
   .addrow{grid-template-columns:minmax(0,1fr)}
@@ -358,7 +363,7 @@ label.fileb{cursor:pointer}
               <span class="chipnote" id="loopNote" hidden></span>
             </div>
 
-            <div class="tbar">
+            <div class="tbar" id="editBar">
               <button class="btn sm" data-ta="undo" type="button">Undo</button>
               <button class="btn sm" data-ta="ins" type="button">Insert column</button>
               <button class="btn sm" data-ta="del" type="button">Delete column</button>
@@ -370,9 +375,9 @@ label.fileb{cursor:pointer}
             </div>
 
             <div class="tbar" id="findTab">
-              <span class="small">Find a tab for this song:</span>
-              <a class="btn sm" id="ugLink" target="_blank" rel="noopener noreferrer">Ultimate Guitar &#8599;</a>
-              <a class="btn sm" id="ssLink" target="_blank" rel="noopener noreferrer">Songsterr &#8599;</a>
+              <div class="seg sm" id="viewSeg"><button type="button" data-view="tab" class="on">Tab editor</button><button type="button" data-view="ug">Ultimate Guitar</button><button type="button" data-view="ss">Songsterr</button></div>
+              <a class="btn sm" id="viewOpen" target="_blank" rel="noopener noreferrer" hidden>Open in new tab &#8599;</a>
+              <span class="sp"></span>
               <button class="btn sm primary" id="pasteClip" type="button">Paste tab from clipboard</button>
             </div>
 
@@ -399,8 +404,12 @@ label.fileb{cursor:pointer}
               <div class="padgrid" id="padGrid"></div>
             </details>
 
+            <div class="webview">
+              <iframe id="webFrame" title="Tab website" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+              <p class="hint">Open a tab, select its text, copy it (Ctrl+C), then press Paste tab from clipboard. If this area stays blank, the site refuses to be shown inside another page, so use Open in new tab.</p>
+            </div>
             <div id="tabScroll" class="tabscroll"><div id="tabGrid"></div></div>
-            <p class="hint">Click a cell and type a fret number (arrow keys move, Backspace clears, | toggles a bar line, Space plays). Drag across the thin strip above the columns to select a section, then mark it learned. A single click on a strip toggles one column.</p>
+            <p class="hint tabhint">Click a cell and type a fret number (arrow keys move, Backspace clears, | toggles a bar line, Space plays). Drag across the thin strip above the columns to select a section, then mark it learned. A single click on a strip toggles one column.</p>
           </div>
         </section>
 
@@ -753,7 +762,7 @@ function openSong(s){
   $('#sTitle').value=s.title;$('#sArtist').value=s.artist;$('#sStatus').value=s.status;$('#sNotes').value=s.notes;
   $('#bpm').value=s.bpm;$('#dSwing').value=s.swing;
   s.last=Date.now();
-  syncToggles();renderPlayer();renderDrums();renderLab();renderTab();loopNote();afterEdit();updateFind();
+  syncToggles();renderPlayer();renderDrums();renderLab();renderTab();loopNote();afterEdit();updateFind();showView('tab');var wf=$('#webFrame');wf.removeAttribute('src');wf.dataset.src='';
   if(!s.artist&&ytId(s.url))autoTitle(s.url).then(function(i){if(cur&&cur.id===s.id&&!cur.artist&&i.artist){cur.artist=i.artist;$('#sArtist').value=i.artist;save();updateFind();}});
   $('#aName').textContent='No audio yet';$('#aPlay').disabled=true;$('#aSeek').disabled=true;$('#aDrop').hidden=true;
   resetGen();A.removeAttribute('src');ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');
@@ -773,6 +782,7 @@ function syncToggles(){
     var c=!!p.col[pn.id];pn.classList.toggle('collapsed',c);
     var h=$('header',pn);if(h)h.setAttribute('aria-expanded',String(!c));
   });
+  syncNarrow();
 }
 function canEmbed(){return db.prefs.embed===null?!SANDBOXED:!!db.prefs.embed;}
 function renderPlayer(){
@@ -950,18 +960,33 @@ function tabIO(a){
   if(a==='replace')cur.cols=cols;else cur.cols=cur.cols.concat(cols);
   cursor={c:0,s:0};selR=null;loop=null;loopNote();renderTab();afterEdit();toast('Tab loaded: '+cols.length+' columns.');
 }
-function updateFind(){
-  if(!cur)return;
+var VIEW='tab';
+function findUrls(){
   var e=encodeURIComponent(((cur.artist||'')+' '+(cur.title||'')).trim());
-  $('#ugLink').href='https://www.ultimate-guitar.com/search.php?search_type=title&value='+e;
-  $('#ssLink').href='https://www.songsterr.com/?pattern='+e;
+  return {ug:'https://www.ultimate-guitar.com/search.php?search_type=title&value='+e,ss:'https://www.songsterr.com/?pattern='+e};
+}
+function showView(v){
+  VIEW=v;
+  $('#pTab').classList.toggle('webmode',v!=='tab');
+  $$('#viewSeg button').forEach(function(b){b.classList.toggle('on',b.dataset.view===v);});
+  var open=$('#viewOpen');
+  if(v==='tab'||!cur){open.hidden=true;return;}
+  var u=findUrls()[v];open.href=u;open.hidden=false;
+  var f=$('#webFrame');
+  if(f.dataset.src!==u){f.dataset.src=u;f.src=u;}
+}
+function updateFind(){if(cur&&VIEW!=='tab')$('#viewOpen').href=findUrls()[VIEW];}
+function syncNarrow(){
+  var w=$('.workspace');if(!w)return;
+  w.classList.toggle('narrow',$('#pPlayer').classList.contains('collapsed')&&$('#pChords').classList.contains('collapsed'));
 }
 async function pasteClip(){
   var t='';
   try{t=await navigator.clipboard.readText();}
-  catch(e){$('#tabIO').hidden=false;$('#tioText').focus();toast('This browser would not share the clipboard. Paste the tab into the box instead.');return;}
+  catch(e){showView('tab');$('#tabIO').hidden=false;$('#tioText').focus();toast('This browser would not share the clipboard. Paste the tab into the box instead.');return;}
   var cols=parseTab(t);
   if(!cols){toast('No six-line tab found on the clipboard. Copy the tab text from the page first.');return;}
+  showView('tab');
   pushUndo(true);cur.cols=cols;cursor={c:0,s:0};selR=null;loop=null;loopNote();renderTab();afterEdit();
   toast('Tab loaded: '+cols.length+' columns. Ctrl+Z brings back the old one.');
 }
@@ -1712,6 +1737,7 @@ function bind(){
   $('#aRec').addEventListener('click',recToggle);
   $('#aLink').addEventListener('click',function(){helperFetch(false);});
   $('#pasteClip').addEventListener('click',pasteClip);
+  $('#viewSeg').addEventListener('click',function(e){var b=e.target.closest('[data-view]');if(b)showView(b.dataset.view);});
   $('#autoFetch').addEventListener('change',function(e){db.prefs.autoFetch=e.target.checked;save();});
   $('#aDrop').addEventListener('click',function(){
     audioDel(cur.id);stopA();resetGen();A.removeAttribute('src');
@@ -1789,7 +1815,7 @@ function bind(){
 
   // keyboard
   document.addEventListener('keydown',function(e){
-    if(!cur||$('#song').hidden)return;
+    if(!cur||$('#song').hidden||VIEW!=='tab')return;
     var t=e.target;
     if(t.closest&&t.closest('input,textarea,select,[contenteditable]'))return;
     if(e.metaKey||e.ctrlKey){if(e.key==='z'||e.key==='Z'){undo();e.preventDefault();}return;}
@@ -1851,6 +1877,7 @@ function togglePanel(p){
   p.classList.toggle('collapsed',c);
   var h=$('header',p);if(h)h.setAttribute('aria-expanded',String(!c));
   if(p.id){db.prefs.col[p.id]=c;save();}
+  syncNarrow();
   if(!c&&p.id==='pTab')renderTab();
 }
 function load0(){
