@@ -268,7 +268,7 @@ label.fileb{cursor:pointer}
                 <button class="btn sm danger" id="aDrop" type="button" hidden>Remove audio</button>
               </div>
               <div class="row"><span class="mono" id="aName">No audio yet</span></div>
-              <p class="hint" id="aRecHint">Record from video: play the video here, press the button, pick this tab (or the tab where the video plays) and tick Share tab audio. Press Stop when the song ends. It records in real time and the audio is saved with this song, so it is there next time you open it. Turn the metronome and drums off while recording.</p>
+              <p class="hint" id="aRecHint">Record from video (Chrome or Edge only, Firefox can not share tab audio): play the video here, press the button, pick this tab (or the tab where the video plays) and tick Share tab audio. Press Stop when the song ends. It records in real time and the audio is saved with this song, so it is there next time you open it. Turn the metronome and drums off while recording.</p>
               <div class="row">
                 <button class="btn sm" id="aPlay" type="button" disabled>&#9654; Play</button>
                 <input type="range" id="aSeek" min="0" max="1000" value="0" aria-label="Seek" disabled>
@@ -1086,6 +1086,7 @@ async function recToggle(){
   if(REC.rec){if(REC.rec.state!=='inactive')REC.rec.stop();return;}
   if(!navigator.mediaDevices||!navigator.mediaDevices.getDisplayMedia||!window.MediaRecorder){toast('This browser can not record tab audio. Use Chrome or Edge on a PC.');return;}
   if(!cur)return;
+  if(/firefox/i.test(navigator.userAgent)){toast('Firefox can not share tab audio. Open Woodshed in Chrome or Edge to record, or use Load audio file.');return;}
   stopT();stopA();
   var st;
   try{
