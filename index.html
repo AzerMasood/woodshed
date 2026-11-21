@@ -281,7 +281,7 @@ label.fileb{cursor:pointer}
                   <p>2. In a terminal run: <span class="mono">pip install -U yt-dlp numpy onnxruntime-directml</span></p>
                   <p>3. Save <span class="mono">woodshed-helper.py</span> anywhere and run: <span class="mono">python woodshed-helper.py</span></p>
                   <p>4. Leave that window open while you use Woodshed. If the browser asks to allow access to devices on your local network, choose Allow.</p>
-                  <p>If yt-dlp complains about a JavaScript runtime for YouTube, install Deno too. For Instagram or sites that need a login, start the helper with <span class="mono">--cookies-from-browser firefox</span>.</p>
+                  <p>If yt-dlp complains about a JavaScript runtime for YouTube, install Deno too. YouTube often asks yt-dlp to prove it is not a bot. If so, start the helper with <span class="mono">python woodshed-helper.py --cookies-from-browser firefox</span> after logging in to YouTube in Firefox. The same option helps for Instagram. Chrome and Edge cookies often fail on Windows, so Firefox is the reliable choice.</p>
                 </div>
               </details>
               <div class="row">
@@ -1179,7 +1179,8 @@ async function helperFetch(auto){
     if(cur&&cur.id===id){attachAudio(blob,name);toast('Audio is ready. Listen, then press Generate.');}
   }catch(e){
     console.error(e);
-    hStatus('Getting the audio failed: '+e.message);
+    var hint=/sign in|not a bot|cookies/i.test(e.message)?' To fix this, close the helper window and start it again with: python woodshed-helper.py --cookies-from-browser firefox (log in to YouTube in Firefox first).':'';
+    hStatus('Getting the audio failed: '+e.message+hint);
     if(cur&&cur.id===id&&!G.file)$('#aName').textContent='No audio yet';
     if(!auto)toast('Could not get the audio. Details are under the audio buttons.');
   }finally{G.fetching=false;}
