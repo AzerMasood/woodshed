@@ -263,9 +263,12 @@ label.fileb{cursor:pointer}
             <div class="row" id="vidBar"></div>
             <div class="audio">
               <div class="row">
+                <button class="btn sm primary" id="aRec" type="button">&#9679; Record from video</button>
                 <label class="btn sm fileb">Load audio file<input type="file" id="aFile" accept="audio/*,video/*"></label>
-                <span class="mono" id="aName">No file loaded</span>
+                <button class="btn sm danger" id="aDrop" type="button" hidden>Remove audio</button>
               </div>
+              <div class="row"><span class="mono" id="aName">No audio yet</span></div>
+              <p class="hint" id="aRecHint">Record from video: play the video here, press the button, pick this tab (or the tab where the video plays) and tick Share tab audio. Press Stop when the song ends. It records in real time and the audio is saved with this song, so it is there next time you open it. Turn the metronome and drums off while recording.</p>
               <div class="row">
                 <button class="btn sm" id="aPlay" type="button" disabled>&#9654; Play</button>
                 <input type="range" id="aSeek" min="0" max="1000" value="0" aria-label="Seek" disabled>
@@ -286,7 +289,7 @@ label.fileb{cursor:pointer}
             </div>
             <div class="audio gen" id="genBox">
               <h3>Generate guitar stem and tab</h3>
-              <p class="hint">Runs entirely in this browser: the Demucs model splits out the guitar, then a note finder turns it into a rough tab. Load an audio file above first. The first run downloads the model (130 to 290 MB) and keeps it for next time.</p>
+              <p class="hint">Runs entirely in this browser: the Demucs model splits out the guitar, then a note finder turns it into a rough tab. Record or load the song's audio above first. The first run downloads the model (130 to 290 MB) and keeps it for next time.</p>
               <div class="row">
                 <label class="small">Engine <select id="gEngine"><option value="auto">Auto</option><option value="webgpu">GPU</option><option value="wasm">CPU only</option></select></label>
                 <label class="small">Section <select id="gRange"><option value="all">Whole song</option><option value="ab">Only the A-B section</option></select></label>
@@ -525,7 +528,7 @@ function route(){
   var s=db.songs.filter(function(x){return x.id===h;})[0];
   if(s)openSong(s);else showLibrary();
 }
-function leaveSong(){stopT();stopA();G.cancel=true;cur=null;selR=null;loop=null;}
+function leaveSong(){stopT();stopA();G.cancel=true;if(REC.rec&&REC.rec.state!=='inactive')REC.rec.stop();cur=null;selR=null;loop=null;}
 function showLibrary(){leaveSong();$('#song').hidden=true;$('#lib').hidden=false;renderLibrary();document.title='Woodshed';}
 
 /* ---------- library ---------- */
@@ -728,8 +731,9 @@ function openSong(s){
   $('#bpm').value=s.bpm;$('#dSwing').value=s.swing;
   s.last=Date.now();
   syncToggles();renderPlayer();renderDrums();renderLab();renderTab();loopNote();afterEdit();
-  $('#aName').textContent='No file loaded';$('#aPlay').disabled=true;$('#aSeek').disabled=true;
+  $('#aName').textContent='No audio yet';$('#aPlay').disabled=true;$('#aSeek').disabled=true;$('#aDrop').hidden=true;
   resetGen();A.removeAttribute('src');ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');
+  var sid=s.id;audioGet(sid).then(function(r){if(r&&r.blob&&cur&&cur.id===sid&&!G.file)attachAudio(r.blob,r.name||'Saved audio');});
 }
 function syncToggles(){
   var p=db.prefs;
@@ -1044,6 +1048,87 @@ function insertChord(){
   refreshCol(cursor.c);paintCursor();afterEdit();toast('Shape placed at column '+(cursor.c+1)+'.');
 }
 
+/* ---------- audio saved with each song (IndexedDB) ---------- */
+var IDB=null;
+function idb(){
+  if(IDB)return IDB;
+  IDB=new Promise(function(res,rej){
+    try{
+      var rq=indexedDB.open('woodshed-audio',1);
+      rq.onupgradeneeded=function(){rq.result.createObjectStore('a');};
+      rq.onsuccess=function(){res(rq.result);};
+      rq.onerror=function(){rej(rq.error);};
+    }catch(e){rej(e);}
+  });
+  return IDB;
+}
+function idbDo(mode,fn){
+  return idb().then(function(d){return new Promise(function(res,rej){
+    var tx=d.transaction('a',mode),rq=fn(tx.objectStore('a'));
+    tx.oncomplete=function(){res(rq&&rq.result);};
+    tx.onerror=tx.onabort=function(){rej(tx.error);};
+  });});
+}
+function audioGet(id){return idbDo('readonly',function(s){return s.get(id);}).catch(function(){return null;});}
+function audioPut(id,blob,name){return idbDo('readwrite',function(s){return s.put({blob:blob,name:name},id);}).catch(function(){toast('This browser would not keep the audio, so it needs loading again next time.');});}
+function audioDel(id){return idbDo('readwrite',function(s){return s.delete(id);}).catch(function(){});}
+function attachAudio(blob,name){
+  stopA();resetGen();
+  G.file=blob;G.origUrl=URL.createObjectURL(blob);A.src=G.origUrl;A.load();
+  $('#aName').textContent=name;$('#aPlay').disabled=false;$('#aSeek').disabled=false;$('#aDrop').hidden=false;
+  setSpeed($('#aSpeed').value);
+  ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');
+}
+
+/* ---------- record the video's audio (tab capture) ---------- */
+var REC={rec:null,stream:null,chunks:[],t0:0,iv:0,id:null,mime:''};
+async function recToggle(){
+  if(REC.rec){if(REC.rec.state!=='inactive')REC.rec.stop();return;}
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getDisplayMedia||!window.MediaRecorder){toast('This browser can not record tab audio. Use Chrome or Edge on a PC.');return;}
+  if(!cur)return;
+  stopT();stopA();
+  var st;
+  try{
+    st=await navigator.mediaDevices.getDisplayMedia({video:true,audio:true,preferCurrentTab:true,selfBrowserSurface:'include',systemAudio:'include'});
+  }catch(e){toast('Recording was cancelled or blocked.');return;}
+  var tr=st.getAudioTracks();
+  if(!tr.length){st.getTracks().forEach(function(t){t.stop();});toast('No audio was shared. Pick a browser tab and tick Share tab audio.');return;}
+  var mime=(window.MediaRecorder.isTypeSupported&&MediaRecorder.isTypeSupported('audio/webm;codecs=opus'))?'audio/webm;codecs=opus':'';
+  var rec;
+  try{rec=new MediaRecorder(new MediaStream(tr),mime?{mimeType:mime}:undefined);}
+  catch(e){st.getTracks().forEach(function(t){t.stop();});toast('This browser could not start recording.');return;}
+  REC={rec:rec,stream:st,chunks:[],t0:Date.now(),iv:0,id:cur.id,mime:mime||'audio/webm'};
+  rec.ondataavailable=function(e){if(e.data&&e.data.size)REC.chunks.push(e.data);};
+  rec.onstop=recDone;
+  tr[0].addEventListener('ended',function(){if(REC.rec&&REC.rec.state!=='inactive')REC.rec.stop();});
+  rec.start(1000);
+  $('#aRec').innerHTML='&#9632; Stop and save';
+  REC.iv=setInterval(function(){$('#aName').textContent='Recording '+fmt((Date.now()-REC.t0)/1000)+'. Press Stop when the song ends.';},500);
+  $('#aName').textContent='Recording 0:00. Press Stop when the song ends.';
+}
+async function recDone(){
+  clearInterval(REC.iv);
+  REC.stream.getTracks().forEach(function(t){t.stop();});
+  var id=REC.id,blob=new Blob(REC.chunks,{type:REC.mime});
+  REC.rec=null;REC.chunks=[];
+  var btn=$('#aRec');if(btn)btn.innerHTML='&#9679; Record from video';
+  var stay=function(){return cur&&cur.id===id;};
+  if(blob.size<2000){if(stay())$('#aName').textContent='No audio yet';toast('Nothing was recorded.');return;}
+  if(stay())$('#aName').textContent='Preparing the recording...';
+  try{
+    var dec=await new OfflineAudioContext(2,1,SR).decodeAudioData(await blob.arrayBuffer());
+    var L=dec.getChannelData(0),R=dec.numberOfChannels>1?dec.getChannelData(1):L;
+    var wav=wavBlob(L,R),name='Recorded from video ('+fmt(dec.duration)+')';
+    await audioPut(id,wav,name);
+    if(stay()){attachAudio(wav,name);toast('Saved with this song. Now you can generate the tab.');}
+    else toast('Recording saved to the song you left.');
+  }catch(e){
+    console.error(e);
+    if(stay())$('#aName').textContent='No audio yet';
+    toast('The recording could not be processed.');
+  }
+}
+
 /* ---------- guitar stem and tab generator (runs in the browser) ---------- */
 var ORT_BASE='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
 var BP_URL='https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/+esm';
@@ -1296,7 +1381,8 @@ function rebuildTab(){
   gStatus('Done: '+cols.length+' columns at '+bpm+' BPM. Expect wrong notes and loose rhythm, so fix them in the tab. Ctrl+Z brings back the old tab.');
   $('#gRebuild').hidden=false;
 }
-function wavURL(L,R){
+function wavURL(L,R){return URL.createObjectURL(wavBlob(L,R));}
+function wavBlob(L,R){
   var n=L.length,buf=new ArrayBuffer(44+n*4),v=new DataView(buf);
   function w(o,s){for(var i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}
   w(0,'RIFF');v.setUint32(4,36+n*4,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,2,true);
@@ -1306,7 +1392,7 @@ function wavURL(L,R){
     var a=Math.max(-1,Math.min(1,L[i]));v.setInt16(o,a<0?a*32768:a*32767,true);o+=2;
     a=Math.max(-1,Math.min(1,R[i]));v.setInt16(o,a<0?a*32768:a*32767,true);o+=2;
   }
-  return URL.createObjectURL(new Blob([buf],{type:'audio/wav'}));
+  return new Blob([buf],{type:'audio/wav'});
 }
 function setSource(k){
   if(!G.stem||!G.mix)return;
@@ -1329,7 +1415,7 @@ function setSource(k){
 }
 async function generate(){
   if(G.busy)return;
-  if(!G.file){toast('Load an audio file first.');return;}
+  if(!G.file){toast('Record or load the song audio first.');return;}
   var engine=$('#gEngine').value,range=$('#gRange').value;
   if(range==='ab'&&!(ab.a!=null&&ab.b!=null&&ab.b>ab.a)){toast('Set points A and B on the audio first.');return;}
   var songId=cur.id;
@@ -1404,7 +1490,7 @@ function bind(){
   var delT=0;
   $('#delSong').addEventListener('click',function(e){
     var b=e.target;
-    if(b.dataset.arm){var id=cur.id;db.songs=db.songs.filter(function(x){return x.id!==id;});save();go('');toast('Song deleted.');return;}
+    if(b.dataset.arm){var id=cur.id;audioDel(id);db.songs=db.songs.filter(function(x){return x.id!==id;});save();go('');toast('Song deleted.');return;}
     b.dataset.arm='1';b.textContent='Click again to delete';
     clearTimeout(delT);delT=setTimeout(function(){delete b.dataset.arm;b.textContent='Delete song';},3000);
   });
@@ -1433,9 +1519,7 @@ function bind(){
   });
   $('#aFile').addEventListener('change',function(e){
     var f=e.target.files[0];if(!f)return;
-    stopA();resetGen();G.file=f;A.src=URL.createObjectURL(f);G.origUrl=A.src;A.load();
-    $('#aName').textContent=f.name;$('#aPlay').disabled=false;$('#aSeek').disabled=false;
-    setSpeed($('#aSpeed').value);
+    attachAudio(f,f.name);audioPut(cur.id,f,f.name);e.target.value='';
   });
   $('#aPlay').addEventListener('click',function(){
     wireA();
@@ -1451,6 +1535,12 @@ function bind(){
   $('#aLoop').addEventListener('click',function(e){ab.on=!ab.on;e.currentTarget.setAttribute('aria-pressed',String(ab.on));});
   $('#aClear').addEventListener('click',function(){ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');});
   $('#aFocus').addEventListener('change',function(){wireA();applyFocus();});
+  $('#aRec').addEventListener('click',recToggle);
+  $('#aDrop').addEventListener('click',function(){
+    audioDel(cur.id);stopA();resetGen();A.removeAttribute('src');
+    $('#aName').textContent='No audio yet';$('#aPlay').disabled=true;$('#aSeek').disabled=true;$('#aDrop').hidden=true;
+    $('#aTime').textContent='0:00 / 0:00';toast('Saved audio removed.');
+  });
   $('#gGo').addEventListener('click',generate);
   $('#gCancel').addEventListener('click',function(){G.cancel=true;gStatus('Cancelling...');});
   $('#gRebuild').addEventListener('click',function(){rebuildTab();});
