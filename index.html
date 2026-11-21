@@ -20,6 +20,7 @@
   --mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{background:var(--bg);color:var(--text);font:14px/1.45 var(--body);margin:0;padding-block:20px 56px;
   padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
 .app{max-width:1640px;margin:0 auto}
@@ -186,6 +187,11 @@ label.fileb{cursor:pointer}
 .mix input[type=range]{width:110px;accent-color:var(--accent)}
 .notes textarea{width:100%;min-height:90px;resize:vertical}
 
+.gen h3{margin:0}
+.gen select,.gen input{padding:5px 8px}
+.gen .seg{align-self:flex-start}
+.gen .mono{white-space:pre-wrap}
+.gbar{height:8px}
 #toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:var(--panel-2);border:1px solid var(--line-2);border-radius:10px;padding:9px 14px;opacity:0;pointer-events:none;transition:.2s;z-index:50;max-width:90vw}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 
@@ -276,7 +282,31 @@ label.fileb{cursor:pointer}
                 <span class="mono" id="aAB"></span>
               </div>
               <label class="small"><input type="checkbox" id="aFocus"> Guitar focus EQ (rough, boosts the guitar range and trims bass and treble)</label>
-              <p class="hint">Real guitar-only stems need a separation model running on a server, so this stays a simple filter for now.</p>
+              <p class="hint">This filter is only a quick approximation. For a real guitar stem, use the generator below.</p>
+            </div>
+            <div class="audio gen" id="genBox">
+              <h3>Generate guitar stem and tab</h3>
+              <p class="hint">Runs entirely in this browser: the Demucs model splits out the guitar, then a note finder turns it into a rough tab. Load an audio file above first. The first run downloads the model (130 to 290 MB) and keeps it for next time.</p>
+              <div class="row">
+                <label class="small">Engine <select id="gEngine"><option value="auto">Auto</option><option value="webgpu">GPU</option><option value="wasm">CPU only</option></select></label>
+                <label class="small">Section <select id="gRange"><option value="all">Whole song</option><option value="ab">Only the A-B section</option></select></label>
+              </div>
+              <div class="row">
+                <label class="small">Grid <select id="gGrid"><option value="2">1/8 notes</option><option value="4">1/16 notes</option></select></label>
+                <label class="small">Notes <select id="gSens"><option value="low">Fewer</option><option value="mid" selected>Balanced</option><option value="high">More</option></select></label>
+                <label class="small">BPM <input id="gBpm" type="number" min="30" max="260" placeholder="auto" style="width:76px" aria-label="Tempo override"></label>
+                <label class="small">Result <select id="gMode"><option value="replace">Replace the tab</option><option value="append">Add to the end</option></select></label>
+              </div>
+              <div class="row">
+                <button class="btn primary" id="gGo" type="button">Generate</button>
+                <button class="btn" id="gCancel" type="button" hidden>Cancel</button>
+                <button class="btn" id="gRebuild" type="button" hidden>Rebuild tab with these settings</button>
+              </div>
+              <div class="bar gbar" id="gBarWrap" hidden><i id="gBar"></i></div>
+              <p class="mono" id="gStatus"></p>
+              <div class="seg" id="gSources" hidden>
+                <button type="button" data-src="orig" class="on">Original</button><button type="button" data-src="gtr">Guitar only</button><button type="button" data-src="bak">No guitar</button>
+              </div>
             </div>
           </div>
         </section>
@@ -495,7 +525,7 @@ function route(){
   var s=db.songs.filter(function(x){return x.id===h;})[0];
   if(s)openSong(s);else showLibrary();
 }
-function leaveSong(){stopT();stopA();cur=null;selR=null;loop=null;}
+function leaveSong(){stopT();stopA();G.cancel=true;cur=null;selR=null;loop=null;}
 function showLibrary(){leaveSong();$('#song').hidden=true;$('#lib').hidden=false;renderLibrary();document.title='Woodshed';}
 
 /* ---------- library ---------- */
@@ -699,7 +729,7 @@ function openSong(s){
   s.last=Date.now();
   syncToggles();renderPlayer();renderDrums();renderLab();renderTab();loopNote();afterEdit();
   $('#aName').textContent='No file loaded';$('#aPlay').disabled=true;$('#aSeek').disabled=true;
-  A.removeAttribute('src');ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');
+  resetGen();A.removeAttribute('src');ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');
 }
 function syncToggles(){
   var p=db.prefs;
@@ -1014,6 +1044,320 @@ function insertChord(){
   refreshCol(cursor.c);paintCursor();afterEdit();toast('Shape placed at column '+(cursor.c+1)+'.');
 }
 
+/* ---------- guitar stem and tab generator (runs in the browser) ---------- */
+var ORT_BASE='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+var BP_URL='https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/+esm';
+var BP_MODEL='https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json';
+var MODELS={
+  gpu:'https://huggingface.co/kramp/htdemucs-6s-webgpu-onnx/resolve/main/htdemucs_6s.onnx',
+  cpu:'https://huggingface.co/StemSplitio/htdemucs-6s-onnx/resolve/main/htdemucs_6s_fp16weights.onnx'
+};
+var SR=44100,SEG=343980;
+var G={file:null,origUrl:'',busy:false,cancel:false,engine:'auto',sess:null,kind:'',mix:null,stem:null,bp:null,bpm:null,urls:{}};
+function gStatus(t){var e=$('#gStatus');if(e)e.textContent=t;}
+function gProg(p){var w=$('#gBarWrap');if(!w)return;w.hidden=(p==null);if(p!=null)$('#gBar').style.width=Math.round(clamp(p,0,1)*100)+'%';}
+function tick(){return new Promise(function(r){setTimeout(r,0);});}
+function busyUI(b){$('#gGo').disabled=b;$('#gCancel').hidden=!b;}
+function resetGen(){
+  ['gtr','bak'].forEach(function(k){if(G.urls[k])URL.revokeObjectURL(G.urls[k]);});
+  G.urls={};
+  if(G.origUrl)URL.revokeObjectURL(G.origUrl);
+  G.origUrl='';G.file=null;G.mix=null;G.stem=null;G.bp=null;G.bpm=null;
+  var s=$('#gSources'),r=$('#gRebuild');
+  if(s)s.hidden=true;if(r)r.hidden=true;
+  gProg(null);gStatus('');
+}
+function loadScript(src){
+  return new Promise(function(res,rej){
+    var s=document.createElement('script');s.src=src;s.onload=res;
+    s.onerror=function(){rej(new Error('Could not load '+src));};document.head.appendChild(s);
+  });
+}
+function fetchModel(url,label){
+  return (async function(){
+    var cache=null;
+    try{cache=await caches.open('woodshed-models');}catch(e){}
+    if(cache){
+      var hit=await cache.match(url);
+      if(hit){gStatus('Loading the '+label+' from cache...');return new Uint8Array(await hit.arrayBuffer());}
+    }
+    var r=await fetch(url);
+    if(!r.ok)throw new Error('Model download failed ('+r.status+')');
+    var total=+r.headers.get('content-length')||0,rd=r.body.getReader(),parts=[],got=0;
+    for(;;){
+      var x=await rd.read();if(x.done)break;
+      parts.push(x.value);got+=x.value.length;
+      gProg(total?got/total:null);
+      gStatus('Downloading the '+label+': '+Math.round(got/1048576)+(total?' of '+Math.round(total/1048576):'')+' MB');
+      if(G.cancel)throw new Error('cancelled');
+    }
+    var blob=new Blob(parts);
+    if(cache){try{await cache.put(url,new Response(blob));}catch(e){}}
+    return new Uint8Array(await blob.arrayBuffer());
+  })();
+}
+async function wasmSession(){
+  ort.env.wasm.numThreads=self.crossOriginIsolated?Math.min(4,navigator.hardwareConcurrency||2):1;
+  ort.env.wasm.proxy=true;
+  var b=await fetchModel(MODELS.cpu,'CPU model');
+  gStatus('Starting the CPU engine...');
+  G.sess=await ort.InferenceSession.create(b,{executionProviders:['wasm']});
+  G.kind='wasm';
+}
+async function getSession(engine){
+  if(!window.ort)await loadScript(ORT_BASE+'ort.webgpu.min.js');
+  ort.env.wasm.wasmPaths=ORT_BASE;
+  if(G.sess&&(engine==='auto'||engine===(G.kind==='webgpu'?'webgpu':'wasm')))return;
+  G.sess=null;
+  var gpu=(engine==='webgpu')||(engine==='auto'&&!!navigator.gpu);
+  if(gpu){
+    try{
+      var b=await fetchModel(MODELS.gpu,'GPU model');
+      gStatus('Starting the GPU engine...');
+      G.sess=await ort.InferenceSession.create(b,{executionProviders:['webgpu'],graphOptimizationLevel:'basic'});
+      G.kind='webgpu';return;
+    }catch(e){
+      if(String(e.message)==='cancelled'||engine==='webgpu')throw e;
+      gStatus('The GPU engine would not start, using the CPU instead...');
+    }
+  }
+  await wasmSession();
+}
+async function runChunk(inp,N){
+  var sess=G.sess,feeds={};
+  feeds[sess.inputNames[0]]=new ort.Tensor('float32',inp.slice(),[1,2,N]);
+  var res=await sess.run(feeds);
+  return res[sess.outputNames[0]];
+}
+async function separate(L,R,s0,s1){
+  var N=SEG,ov=Math.floor(N/4),stride=N-ov,total=s1-s0,nCh=Math.max(1,Math.ceil((total-ov)/stride));
+  var accL=new Float32Array(total),accR=new Float32Array(total),wsum=new Float32Array(total);
+  var win=new Float32Array(N);
+  for(var j=0;j<N;j++)win[j]=Math.min(1,(j+1)/ov,(N-j)/ov);
+  var inp=new Float32Array(2*N),t0=performance.now();
+  for(var i=0;i<nCh;i++){
+    if(G.cancel)throw new Error('cancelled');
+    var p=i*stride,len=Math.min(N,total-p);
+    inp.fill(0);
+    inp.set(L.subarray(s0+p,s0+p+len),0);inp.set(R.subarray(s0+p,s0+p+len),N);
+    var out;
+    try{out=await runChunk(inp,N);}
+    catch(e){
+      if(i===0&&G.kind==='webgpu'&&G.engine==='auto'){
+        gStatus('The GPU run failed, switching to the CPU...');
+        await wasmSession();out=await runChunk(inp,N);
+      }else throw e;
+    }
+    var dims=out.dims;
+    if(!dims||dims.length<4||dims[1]<6)throw new Error('This model has no guitar stem.');
+    var d=out.data,base=4*2*N;
+    for(var k=0;k<len;k++){
+      var w=win[k];
+      accL[p+k]+=d[base+k]*w;accR[p+k]+=d[base+N+k]*w;wsum[p+k]+=w;
+    }
+    if(out.dispose)out.dispose();
+    var el=(performance.now()-t0)/1000,left=el/(i+1)*(nCh-i-1);
+    gProg((i+1)/nCh);
+    gStatus('Splitting out the guitar: segment '+(i+1)+' of '+nCh+(i>0?', about '+fmt(left)+' left':''));
+    await tick();
+  }
+  var gl=new Float32Array(L.length),gr=new Float32Array(L.length);
+  for(var q=0;q<total;q++){var ws=Math.max(wsum[q],1e-8);gl[s0+q]=accL[q]/ws;gr[s0+q]=accR[q]/ws;}
+  return {L:gl,R:gr};
+}
+function estimateBpm(L,R,s0,s1){
+  var hop=512,win=1024,n=Math.floor((s1-s0-win)/hop);
+  if(n<300)return null;
+  var env=new Float32Array(n);
+  for(var i=0;i<n;i++){
+    var o=s0+i*hop,e=0;
+    for(var j=2;j<win;j+=2){var x=(L[o+j]+R[o+j]-L[o+j-1]-R[o+j-1])*.5;e+=x*x;}
+    env[i]=Math.log(1+Math.sqrt(e/(win/2))*200);
+  }
+  var fl=new Float32Array(n);
+  for(var k=1;k<n;k++)fl[k]=Math.max(0,env[k]-env[k-1]);
+  var fps=SR/hop,best=0,bl=0,lmin=Math.floor(fps*60/200),lmax=Math.ceil(fps*60/55);
+  for(var lag=lmin;lag<=lmax;lag++){
+    var s=0;
+    for(var m=0;m+lag<n;m++)s+=fl[m]*fl[m+lag];
+    s/=(n-lag);
+    var bpm=60*fps/lag;
+    s*=Math.exp(-.5*Math.pow(Math.log(bpm/110)/Math.LN2/.9,2));
+    if(s>best){best=s;bl=lag;}
+  }
+  return bl?Math.round(60*fps/bl):null;
+}
+async function transcribe(){
+  try{
+    gStatus('Loading the note finder...');gProg(null);await tick();
+    var mod=await import(BP_URL);
+    var pick=function(n){return mod[n]||(mod.default&&mod.default[n]);};
+    var BPc=pick('BasicPitch'),f1=pick('outputToNotesPoly'),f2=pick('addPitchBendsToNoteEvents'),f3=pick('noteFramesToTime');
+    if(!BPc||!f1||!f3)throw new Error('the note finder library has an unexpected shape');
+    var m=G.stem,total=m.s1-m.s0,n=Math.floor(total/2),mono=new Float32Array(n),last=m.L.length-1;
+    for(var i=0;i<n;i++){
+      var a=2*i+m.s0,p=a>0?a-1:a,q=a<last?a+1:a;
+      mono[i]=((m.L[p]+m.R[p])+2*(m.L[a]+m.R[a])+(m.L[q]+m.R[q]))/8;
+    }
+    var bp=new BPc(BP_MODEL),frames=[],onsets=[],contours=[];
+    await bp.evaluateModel(mono,function(f,o,c){
+      for(var k=0;k<f.length;k++){frames.push(f[k]);onsets.push(o[k]);contours.push(c[k]);}
+    },function(pc){var pr=pc>1?pc/100:pc;gProg(pr);gStatus('Finding notes: '+Math.round(pr*100)+'%');});
+    G.bp={frames:frames,onsets:onsets,contours:contours,f1:f1,f2:f2,f3:f3};
+    return true;
+  }catch(e){
+    console.error(e);
+    gStatus('The guitar stem is ready, but the note finder failed: '+e.message);
+    return false;
+  }
+}
+function notesFrom(bp,sens){
+  var th={low:[.6,.4,6,.35],mid:[.5,.3,5,.25],high:[.35,.25,4,.15]}[sens]||[.5,.3,5,.25];
+  var ev=bp.f1(bp.frames,bp.onsets,th[0],th[1],th[2]);
+  if(bp.f2){try{ev=bp.f2(bp.contours,ev);}catch(e){}}
+  return bp.f3(ev).map(function(n){
+    return {t:n.startTimeSeconds,d:n.durationSeconds,m:(n.pitchMidi!=null?n.pitchMidi:n.pitch_midi),a:n.amplitude};
+  }).filter(function(n){return n.m>=40&&n.m<=86&&n.a>=th[3]&&n.d>=.05;});
+}
+function nodeInfo(a){
+  var fr=a.filter(function(x){return x[1]>0;}).map(function(x){return x[1];});
+  var cost=0,pos=null;
+  if(fr.length){
+    var mn=Math.min.apply(null,fr),mx=Math.max.apply(null,fr);
+    pos=fr.reduce(function(s,x){return s+x;},0)/fr.length;
+    if(mx-mn>4)cost+=(mx-mn-4)*3;
+  }
+  a.forEach(function(x){cost+=.04*x[1];if(x[1]>14)cost+=(x[1]-14)*.3;});
+  return {a:a.slice(),cost:cost,pos:pos,str:a.reduce(function(s,x){return s+x[0];},0)/a.length};
+}
+function candidates(ms){
+  var opts=ms.map(function(m){var o=[];for(var s=0;s<6;s++){var f=m-TUNE[s];if(f>=0&&f<=22)o.push([s,f]);}return o;});
+  if(opts.some(function(o){return !o.length;}))return [];
+  var order=ms.map(function(_,i){return i;}).sort(function(a,b){return opts[a].length-opts[b].length;});
+  var res=[],used=[false,false,false,false,false,false],pk=new Array(ms.length);
+  (function rec(d){
+    if(res.length>4000)return;
+    if(d===order.length){res.push(pk.slice());return;}
+    var i=order[d];
+    opts[i].forEach(function(x){if(used[x[0]])return;used[x[0]]=true;pk[i]=x;rec(d+1);used[x[0]]=false;});
+  })(0);
+  return res.map(nodeInfo).sort(function(x,y){return x.cost-y.cost;}).slice(0,40);
+}
+function buildTab(notes,bpm,spb){
+  if(!notes.length)return null;
+  notes=notes.slice().sort(function(a,b){return a.t-b.t;});
+  var cl=[];
+  notes.forEach(function(n){var c=cl[cl.length-1];if(c&&n.t-c.t<=.06)c.n.push(n);else cl.push({t:n.t,n:[n]});});
+  var t0=cl[0].t,step=60/bpm/spb,byCol={};
+  cl.forEach(function(c){var k=Math.max(0,Math.round((c.t-t0)/step));(byCol[k]=byCol[k]||[]).push.apply(byCol[k],c.n);});
+  var keys=Object.keys(byCol).map(Number).sort(function(a,b){return a-b;}),seq=[];
+  keys.forEach(function(k){
+    var uniq={};
+    byCol[k].forEach(function(n){var m=Math.round(n.m);if(!uniq[m]||uniq[m].a<n.a)uniq[m]={m:m,a:n.a};});
+    var ms=Object.keys(uniq).map(function(m){return uniq[m];}).sort(function(a,b){return b.a-a.a;}).slice(0,6);
+    var cs=[];
+    while(ms.length){cs=candidates(ms.map(function(x){return x.m;}));if(cs.length)break;ms.pop();}
+    if(cs.length)seq.push({k:k,c:cs});
+  });
+  if(!seq.length)return null;
+  var dp=[],bk=[];
+  seq.forEach(function(el,i){
+    var row=[],br=[];
+    el.c.forEach(function(c){
+      if(i===0){row.push(c.cost);br.push(-1);return;}
+      var pc=seq[i-1].c,best=1e18,bi=0;
+      for(var k=0;k<pc.length;k++){
+        var p=pc[k],t=dp[i-1][k]+(p.pos!=null&&c.pos!=null?Math.abs(p.pos-c.pos)*.5:0)+Math.abs(p.str-c.str)*.08;
+        if(t<best){best=t;bi=k;}
+      }
+      row.push(best+c.cost);br.push(bi);
+    });
+    dp.push(row);bk.push(br);
+  });
+  var last=dp[dp.length-1],bj=0;
+  for(var q=1;q<last.length;q++)if(last[q]<last[bj])bj=q;
+  var chosen=new Array(seq.length);
+  for(var i2=seq.length-1;i2>=0;i2--){chosen[i2]=seq[i2].c[bj].a;bj=bk[i2][bj];}
+  var barLen=4*spb,total=Math.ceil((seq[seq.length-1].k+1)/barLen)*barLen,cols=[];
+  for(var i3=0;i3<total;i3++){var c=blankCol();c.b=(i3%barLen===barLen-1);cols.push(c);}
+  seq.forEach(function(el,i){chosen[i].forEach(function(x){cols[el.k].n[x[0]]=String(x[1]);});});
+  return cols;
+}
+function rebuildTab(){
+  if(!G.bp||!cur){toast('Generate a tab first.');return;}
+  var spb=+$('#gGrid').value,bpm=clamp(Math.round(+$('#gBpm').value||G.bpm||cur.bpm),30,260);
+  var cols=buildTab(notesFrom(G.bp,$('#gSens').value),bpm,spb);
+  if(!cols){gStatus('No usable guitar notes were found. Try "More" under Notes.');return;}
+  pushUndo(true);
+  cur.cols=($('#gMode').value==='append')?cur.cols.concat(cols):cols;
+  cur.bpm=bpm;$('#bpm').value=bpm;
+  db.prefs.div=(spb===4)?1:2;$('#tabDiv').value=String(db.prefs.div);
+  cursor={c:0,s:0};selR=null;loop=null;loopNote();renderTab();afterEdit();
+  gStatus('Done: '+cols.length+' columns at '+bpm+' BPM. Expect wrong notes and loose rhythm, so fix them in the tab. Ctrl+Z brings back the old tab.');
+  $('#gRebuild').hidden=false;
+}
+function wavURL(L,R){
+  var n=L.length,buf=new ArrayBuffer(44+n*4),v=new DataView(buf);
+  function w(o,s){for(var i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));}
+  w(0,'RIFF');v.setUint32(4,36+n*4,true);w(8,'WAVE');w(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,2,true);
+  v.setUint32(24,SR,true);v.setUint32(28,SR*4,true);v.setUint16(32,4,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,n*4,true);
+  var o=44;
+  for(var i=0;i<n;i++){
+    var a=Math.max(-1,Math.min(1,L[i]));v.setInt16(o,a<0?a*32768:a*32767,true);o+=2;
+    a=Math.max(-1,Math.min(1,R[i]));v.setInt16(o,a<0?a*32768:a*32767,true);o+=2;
+  }
+  return URL.createObjectURL(new Blob([buf],{type:'audio/wav'}));
+}
+function setSource(k){
+  if(!G.stem||!G.mix)return;
+  var url;
+  if(k==='orig')url=G.origUrl;
+  else if(k==='gtr'){if(!G.urls.gtr)G.urls.gtr=wavURL(G.stem.L,G.stem.R);url=G.urls.gtr;}
+  else{
+    if(!G.urls.bak){
+      var n=G.mix.len,bl=new Float32Array(n),br=new Float32Array(n);
+      for(var i=0;i<n;i++){bl[i]=G.mix.L[i]-G.stem.L[i];br[i]=G.mix.R[i]-G.stem.R[i];}
+      G.urls.bak=wavURL(bl,br);
+    }
+    url=G.urls.bak;
+  }
+  if(!url)return;
+  var t=A.currentTime,was=!A.paused;
+  A.src=url;A.load();setSpeed($('#aSpeed').value);
+  A.addEventListener('loadedmetadata',function(){A.currentTime=t;if(was)A.play();},{once:true});
+  $$('#gSources button').forEach(function(b){b.classList.toggle('on',b.dataset.src===k);});
+}
+async function generate(){
+  if(G.busy)return;
+  if(!G.file){toast('Load an audio file first.');return;}
+  var engine=$('#gEngine').value,range=$('#gRange').value;
+  if(range==='ab'&&!(ab.a!=null&&ab.b!=null&&ab.b>ab.a)){toast('Set points A and B on the audio first.');return;}
+  var songId=cur.id;
+  G.busy=true;G.cancel=false;G.engine=engine;busyUI(true);
+  try{
+    gStatus('Reading the audio file...');gProg(null);await tick();
+    var decoded=await new OfflineAudioContext(2,1,SR).decodeAudioData(await G.file.arrayBuffer());
+    var L=decoded.getChannelData(0),R=decoded.numberOfChannels>1?decoded.getChannelData(1):L;
+    var len=L.length,s0=0,s1=len;
+    if(range==='ab'){s0=clamp(Math.floor(ab.a*SR),0,len-1);s1=clamp(Math.ceil(ab.b*SR),Math.min(len,s0+SR),len);}
+    G.mix={L:L,R:R,len:len};G.bp=null;
+    await getSession(engine);
+    var g=await separate(L,R,s0,s1);
+    G.stem={L:g.L,R:g.R,s0:s0,s1:s1};
+    $('#gSources').hidden=false;
+    $$('#gSources button').forEach(function(b){b.classList.toggle('on',b.dataset.src==='orig');});
+    gStatus('Finding the tempo...');gProg(null);await tick();
+    G.bpm=estimateBpm(L,R,s0,s1)||(cur?cur.bpm:90);
+    $('#gBpm').placeholder='auto ('+G.bpm+')';
+    var ok=await transcribe();
+    if(ok&&cur&&cur.id===songId)rebuildTab();
+    else if(ok)gStatus('Done, but you left the song before the tab was placed.');
+  }catch(e){
+    if(String(e.message)==='cancelled')gStatus('Cancelled.');
+    else{console.error(e);gStatus('That did not work: '+e.message);toast('Generating failed. Details are under the Generate button.');}
+  }finally{G.busy=false;busyUI(false);gProg(null);}
+}
+
 /* ---------- events ---------- */
 function bind(){
   $('#home').addEventListener('click',function(e){e.preventDefault();go('');});
@@ -1089,7 +1433,7 @@ function bind(){
   });
   $('#aFile').addEventListener('change',function(e){
     var f=e.target.files[0];if(!f)return;
-    stopA();A.src=URL.createObjectURL(f);A.load();
+    stopA();resetGen();G.file=f;A.src=URL.createObjectURL(f);G.origUrl=A.src;A.load();
     $('#aName').textContent=f.name;$('#aPlay').disabled=false;$('#aSeek').disabled=false;
     setSpeed($('#aSpeed').value);
   });
@@ -1107,6 +1451,10 @@ function bind(){
   $('#aLoop').addEventListener('click',function(e){ab.on=!ab.on;e.currentTarget.setAttribute('aria-pressed',String(ab.on));});
   $('#aClear').addEventListener('click',function(){ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');});
   $('#aFocus').addEventListener('change',function(){wireA();applyFocus();});
+  $('#gGo').addEventListener('click',generate);
+  $('#gCancel').addEventListener('click',function(){G.cancel=true;gStatus('Cancelling...');});
+  $('#gRebuild').addEventListener('click',function(){rebuildTab();});
+  $('#gSources').addEventListener('click',function(e){var b=e.target.closest('[data-src]');if(b)setSource(b.dataset.src);});
 
   // transport
   $('#tPlay').addEventListener('click',toggleT);
