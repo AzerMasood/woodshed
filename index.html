@@ -192,6 +192,8 @@ label.fileb{cursor:pointer}
 .gen .seg{align-self:flex-start}
 .gen .mono{white-space:pre-wrap}
 .gbar{height:8px}
+.seg.wrap{flex-wrap:wrap}
+.seg.wrap button{flex:none}
 #toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:var(--panel-2);border:1px solid var(--line-2);border-radius:10px;padding:9px 14px;opacity:0;pointer-events:none;transition:.2s;z-index:50;max-width:90vw}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 
@@ -263,12 +265,25 @@ label.fileb{cursor:pointer}
             <div class="row" id="vidBar"></div>
             <div class="audio">
               <div class="row">
-                <button class="btn sm primary" id="aRec" type="button">&#9679; Record from video</button>
+                <button class="btn sm primary" id="aLink" type="button">Get audio from link</button>
+                <button class="btn sm" id="aRec" type="button">&#9679; Record from video</button>
                 <label class="btn sm fileb">Load audio file<input type="file" id="aFile" accept="audio/*,video/*"></label>
                 <button class="btn sm danger" id="aDrop" type="button" hidden>Remove audio</button>
               </div>
               <div class="row"><span class="mono" id="aName">No audio yet</span></div>
               <p class="hint" id="aRecHint">Record from video (Chrome or Edge only, Firefox can not share tab audio): play the video here, press the button, pick this tab (or the tab where the video plays) and tick Share tab audio. Press Stop when the song ends. It records in real time and the audio is saved with this song, so it is there next time you open it. Turn the metronome and drums off while recording.</p>
+              <p class="hint" id="hStatus"></p>
+              <label class="small"><input type="checkbox" id="autoFetch"> Fetch the audio automatically when I open a song that has a link</label>
+              <details class="pad"><summary>Set up the helper (once)</summary>
+                <div class="hint" style="margin-top:8px">
+                  <p>The helper is one small file that runs on your PC. It fetches the audio from the link with yt-dlp and splits the song on your graphics card.</p>
+                  <p>1. Install Python from python.org if you do not have it (tick Add to PATH).</p>
+                  <p>2. In a terminal run: <span class="mono">pip install -U yt-dlp numpy onnxruntime-directml</span></p>
+                  <p>3. Save <span class="mono">woodshed-helper.py</span> anywhere and run: <span class="mono">python woodshed-helper.py</span></p>
+                  <p>4. Leave that window open while you use Woodshed. If the browser asks to allow access to devices on your local network, choose Allow.</p>
+                  <p>If yt-dlp complains about a JavaScript runtime for YouTube, install Deno too. For Instagram or sites that need a login, start the helper with <span class="mono">--cookies-from-browser firefox</span>.</p>
+                </div>
+              </details>
               <div class="row">
                 <button class="btn sm" id="aPlay" type="button" disabled>&#9654; Play</button>
                 <input type="range" id="aSeek" min="0" max="1000" value="0" aria-label="Seek" disabled>
@@ -289,10 +304,11 @@ label.fileb{cursor:pointer}
             </div>
             <div class="audio gen" id="genBox">
               <h3>Generate guitar stem and tab</h3>
-              <p class="hint">Runs entirely in this browser: the Demucs model splits out the guitar, then a note finder turns it into a rough tab. Record or load the song's audio above first. The first run downloads the model (about 285 MB) and keeps it for next time. Starting the engine can take a minute or two, and it runs in the background so the page stays usable.</p>
+              <p class="hint">Splits the song into instruments, then turns the track you pick into a rough tab. With the helper running it uses your PC's graphics card. Without it, the browser engine is far slower and downloads about 285 MB on first use. Get the song audio above first.</p>
               <div class="row">
-                <label class="small">Engine <select id="gEngine"><option value="auto">Auto</option><option value="webgpu">GPU</option><option value="wasm">CPU only</option></select></label>
+                <label class="small">Engine <select id="gEngine"><option value="auto">Auto (helper first)</option><option value="helper">Helper only</option><option value="webgpu">Browser GPU</option><option value="wasm">Browser CPU (slow)</option></select></label>
                 <label class="small">Section <select id="gRange"><option value="all">Whole song</option><option value="ab">Only the A-B section</option></select></label>
+                <label class="small">Transcribe <select id="gTrack"><option value="4">Guitar</option><option value="2">Other (often lead guitar)</option><option value="5">Piano and keys</option></select></label>
               </div>
               <div class="row">
                 <label class="small">Grid <select id="gGrid"><option value="2">1/8 notes</option><option value="4">1/16 notes</option></select></label>
@@ -307,9 +323,7 @@ label.fileb{cursor:pointer}
               </div>
               <div class="bar gbar" id="gBarWrap" hidden><i id="gBar"></i></div>
               <p class="mono" id="gStatus"></p>
-              <div class="seg" id="gSources" hidden>
-                <button type="button" data-src="orig" class="on">Original</button><button type="button" data-src="gtr">Guitar only</button><button type="button" data-src="bak">No guitar</button>
-              </div>
+              <div class="seg wrap" id="gSources" hidden></div>
             </div>
           </div>
         </section>
@@ -455,7 +469,7 @@ var STEP_LBL=['1','e','&','a','2','e','&','a','3','e','&','a','4','e','&','a'];
 /* ---------- state ---------- */
 var KEY='woodshed.v1';
 var SANDBOXED=/claude|anthropic/i.test(location.hostname);
-var PD={metro:true,drums:false,tab:false,div:2,audition:true,embed:null,col:{},mix:{c:70,d:80,t:80}};
+var PD={metro:true,drums:false,tab:false,div:2,audition:true,autoFetch:true,embed:null,col:{},mix:{c:70,d:80,t:80}};
 var db={songs:[],prefs:{},seeded:false};
 var cur=null, cursor={c:0,s:0}, selR=null, loop=null, drag=null, colEls=[], rowPer=0;
 var undoStack=[], lastU=0, lastType=0;
@@ -733,12 +747,17 @@ function openSong(s){
   syncToggles();renderPlayer();renderDrums();renderLab();renderTab();loopNote();afterEdit();
   $('#aName').textContent='No audio yet';$('#aPlay').disabled=true;$('#aSeek').disabled=true;$('#aDrop').hidden=true;
   resetGen();A.removeAttribute('src');ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');
-  var sid=s.id;audioGet(sid).then(function(r){if(r&&r.blob&&cur&&cur.id===sid&&!G.file)attachAudio(r.blob,r.name||'Saved audio');});
+  hStatus('');
+  var sid=s.id;audioGet(sid).then(function(r){
+    if(!cur||cur.id!==sid||G.file)return;
+    if(r&&r.blob)attachAudio(r.blob,r.name||'Saved audio');
+    else if(db.prefs.autoFetch!==false&&cur.url)helperFetch(true);
+  });
 }
 function syncToggles(){
   var p=db.prefs;
   $$('[data-tg]').forEach(function(b){b.setAttribute('aria-pressed',String(!!p[b.dataset.tg]));});
-  $('#tabDiv').value=String(p.div);$('#audition').checked=!!p.audition;
+  $('#tabDiv').value=String(p.div);$('#audition').checked=!!p.audition;$('#autoFetch').checked=p.autoFetch!==false;
   $('#mixC').value=p.mix.c;$('#mixD').value=p.mix.d;$('#mixT').value=p.mix.t;
   $$('.panel[id]').forEach(function(pn){
     var c=!!p.col[pn.id];pn.classList.toggle('collapsed',c);
@@ -1130,22 +1149,78 @@ async function recDone(){
   }
 }
 
-/* ---------- guitar stem and tab generator (runs in the browser) ---------- */
+/* ---------- helper on your PC: audio from a link, fast splitting ---------- */
+var HELPER='http://127.0.0.1:8765';
+function hStatus(t){var e=$('#hStatus');if(e)e.textContent=t;}
+function helperPing(){
+  var ac=new AbortController(),to=setTimeout(function(){ac.abort();},1800);
+  return fetch(HELPER+'/ping',{signal:ac.signal}).then(function(r){return r.json();}).then(function(j){clearTimeout(to);return j;}).catch(function(){clearTimeout(to);return null;});
+}
+async function helperFetch(auto){
+  if(!cur||G.fetching)return;
+  var u=cur.url,id=cur.id;
+  if(!u){if(!auto)toast('Add a video link first.');return;}
+  G.fetching=true;
+  try{
+    var ping=await helperPing();
+    if(!ping){hStatus('The helper is not running, so the audio was not fetched. Start woodshed-helper.py on your PC and press Get audio from link. Steps are under Set up the helper.');if(!auto)toast('The helper is not running.');return;}
+    if(!ping.ytdlp){hStatus('The helper is running but yt-dlp is missing. In a terminal run: pip install -U yt-dlp');if(!auto)toast('yt-dlp is missing.');return;}
+    hStatus('Helper connected (yt-dlp '+ping.ytdlp+'). '+(ping.separate?'Fast splitting is ready.':'Fast splitting is not installed: pip install numpy onnxruntime-directml'));
+    var t0=Date.now(),ac=new AbortController(),to=setTimeout(function(){ac.abort();},330000);
+    var iv=setInterval(function(){if(cur&&cur.id===id&&!G.file)$('#aName').textContent='Getting audio from the link... '+Math.round((Date.now()-t0)/1000)+' s';},1000);
+    var r;
+    try{r=await fetch(HELPER+'/audio?url='+encodeURIComponent(u),{signal:ac.signal});}
+    finally{clearInterval(iv);clearTimeout(to);}
+    if(!r.ok){var msg='';try{msg=(await r.json()).error;}catch(e){}throw new Error(msg||('the helper answered '+r.status));}
+    var blob=await r.blob();
+    if(blob.size<2000)throw new Error('the helper sent an empty file');
+    var name='From link ('+platform(hostOf(u))+')';
+    await audioPut(id,blob,name);
+    if(cur&&cur.id===id){attachAudio(blob,name);toast('Audio is ready. Listen, then press Generate.');}
+  }catch(e){
+    console.error(e);
+    hStatus('Getting the audio failed: '+e.message);
+    if(cur&&cur.id===id&&!G.file)$('#aName').textContent='No audio yet';
+    if(!auto)toast('Could not get the audio. Details are under the audio buttons.');
+  }finally{G.fetching=false;}
+}
+async function separateViaHelper(L,R,s0,s1){
+  var total=s1-s0,body=new Float32Array(2*total);
+  body.set(L.subarray(s0,s1),0);body.set(R.subarray(s0,s1),total);
+  var t0=Date.now(),ac=new AbortController();G.hAbort=ac;
+  var iv=setInterval(function(){gStatus('Splitting on the helper ('+Math.round((Date.now()-t0)/1000)+' s). The helper window shows progress. The first run also downloads the model.');},1000);
+  gStatus('Sending the audio to the helper...');gProg(null);
+  var r;
+  try{
+    r=await fetch(HELPER+'/separate?n='+total,{method:'POST',body:body.buffer,signal:ac.signal,headers:{'Content-Type':'application/octet-stream'}});
+  }catch(e){
+    if(e&&e.name==='AbortError')throw new Error('cancelled');
+    throw new Error('could not reach the helper');
+  }finally{clearInterval(iv);G.hAbort=null;}
+  if(!r.ok){var msg='';try{msg=(await r.json()).error;}catch(e){}throw new Error(msg||('the helper answered '+r.status));}
+  var buf=await r.arrayBuffer();
+  if(buf.byteLength!==6*2*total*4)throw new Error('the helper sent an unexpected result');
+  var Ls=[],Rs=[];
+  for(var s=0;s<6;s++){Ls.push(new Float32Array(buf,(s*2)*total*4,total));Rs.push(new Float32Array(buf,(s*2+1)*total*4,total));}
+  return {L:Ls,R:Rs,info:'Split on '+(r.headers.get('X-Provider')||'the helper')+' in '+(r.headers.get('X-Seconds')||'?')+' s.'};
+}
+
+/* ---------- guitar stem and tab generator (runs in the browser) ---------- *//* ---------- guitar stem and tab generator (runs in the browser) ---------- */
 var ORT_BASE='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
 var BP_URL='https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/+esm';
 var BP_MODEL='https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json';
 var MODELS={gpu:'https://huggingface.co/kramp/htdemucs-6s-webgpu-onnx/resolve/main/htdemucs_6s.onnx'};
 var SR=44100,SEG=343980;
-var G={file:null,origUrl:'',busy:false,cancel:false,engine:'auto',worker:null,pend:null,kind:'',mix:null,stem:null,bp:null,bpm:null,urls:{}};
+var G={file:null,origUrl:'',busy:false,cancel:false,engine:'auto',worker:null,pend:null,kind:'',mix:null,st:null,bp:null,bpm:null,urls:{},fetching:false,hAbort:null};
 function gStatus(t){var e=$('#gStatus');if(e)e.textContent=t;}
 function gProg(p){var w=$('#gBarWrap');if(!w)return;w.hidden=(p==null);if(p!=null)$('#gBar').style.width=Math.round(clamp(p,0,1)*100)+'%';}
 function tick(){return new Promise(function(r){setTimeout(r,0);});}
 function busyUI(b){$('#gGo').disabled=b;$('#gCancel').hidden=!b;}
 function resetGen(){
-  ['gtr','bak'].forEach(function(k){if(G.urls[k])URL.revokeObjectURL(G.urls[k]);});
+  Object.keys(G.urls).forEach(function(k){if(G.urls[k])URL.revokeObjectURL(G.urls[k]);});
   G.urls={};
   if(G.origUrl)URL.revokeObjectURL(G.origUrl);
-  G.origUrl='';G.file=null;G.mix=null;G.stem=null;G.bp=null;G.bpm=null;
+  G.origUrl='';G.file=null;G.mix=null;G.st=null;G.bp=null;G.bpm=null;
   var s=$('#gSources'),r=$('#gRebuild');
   if(s)s.hidden=true;if(r)r.hidden=true;
   gProg(null);gStatus('');
@@ -1195,8 +1270,8 @@ function workerMain(){
         var feeds={};feeds[sess.inputNames[0]]=new ort.Tensor('float32',m.data,[1,2,m.N]);
         var r=await sess.run(feeds),o=r[sess.outputNames[0]],dims=o.dims;
         if(!dims||dims.length<4||dims[1]<6){self.postMessage({type:'error',msg:'This model has no guitar stem.'});return;}
-        var d=o.data,N=m.N,base=4*2*N,out=new Float32Array(2*N);
-        out.set(d.subarray(base,base+2*N));
+        var d=o.data,out=new Float32Array(d.length);
+        out.set(d);
         if(o.dispose)o.dispose();
         self.postMessage({type:'done',out:out},[out.buffer]);
       }
@@ -1249,8 +1324,9 @@ async function startEngine(engine){
   throw lastErr;
 }
 async function separate(L,R,s0,s1){
-  var N=SEG,ov=Math.floor(N/4),stride=N-ov,total=s1-s0,nCh=Math.max(1,Math.ceil((total-ov)/stride));
-  var accL=new Float32Array(total),accR=new Float32Array(total),wsum=new Float32Array(total);
+  var N=SEG,ov=Math.floor(N/4),stride=N-ov,total=s1-s0,nCh=Math.max(1,Math.ceil((total-ov)/stride)),NS=6;
+  var accL=[],accR=[],wsum=new Float32Array(total);
+  for(var s=0;s<NS;s++){accL.push(new Float32Array(total));accR.push(new Float32Array(total));}
   var win=new Float32Array(N);
   for(var j=0;j<N;j++)win[j]=Math.min(1,(j+1)/ov,(N-j)/ov);
   var inp=new Float32Array(2*N),t0=performance.now(),left=0;
@@ -1259,7 +1335,7 @@ async function separate(L,R,s0,s1){
     var p=i*stride,len=Math.min(N,total-p);
     inp.fill(0);
     inp.set(L.subarray(s0+p,s0+p+len),0);inp.set(R.subarray(s0+p,s0+p+len),N);
-    var label='Splitting out the guitar: segment '+(i+1)+' of '+nCh+(i>0?', about '+fmt(left)+' left':''),res;
+    var label='Splitting on the '+(G.kind==='webgpu'?'browser GPU':'browser CPU')+': segment '+(i+1)+' of '+nCh+(i>0?', about '+fmt(left)+' left':''),res;
     try{
       var cp=inp.slice();
       res=await wcall({type:'run',N:N,data:cp},[cp.buffer],label,0);
@@ -1272,17 +1348,20 @@ async function separate(L,R,s0,s1){
       }else throw e;
     }
     var d=res.out;
-    for(var k=0;k<len;k++){
-      var w=win[k];
-      accL[p+k]+=d[k]*w;accR[p+k]+=d[N+k]*w;wsum[p+k]+=w;
+    for(var s2=0;s2<NS;s2++){
+      var oL=(s2*2)*N,oR=(s2*2+1)*N,aL=accL[s2],aR=accR[s2];
+      for(var k=0;k<len;k++){var w=win[k];aL[p+k]+=d[oL+k]*w;aR[p+k]+=d[oR+k]*w;}
     }
+    for(var k2=0;k2<len;k2++)wsum[p+k2]+=win[k2];
     var el=(performance.now()-t0)/1000;left=el/(i+1)*(nCh-i-1);
     gProg((i+1)/nCh);
     await tick();
   }
-  var gl=new Float32Array(L.length),gr=new Float32Array(L.length);
-  for(var q=0;q<total;q++){var ws=Math.max(wsum[q],1e-8);gl[s0+q]=accL[q]/ws;gr[s0+q]=accR[q]/ws;}
-  return {L:gl,R:gr};
+  for(var q=0;q<total;q++){
+    var inv=1/Math.max(wsum[q],1e-8);
+    for(var s3=0;s3<NS;s3++){accL[s3][q]*=inv;accR[s3][q]*=inv;}
+  }
+  return {L:accL,R:accR};
 }
 function estimateBpm(L,R,s0,s1){
   var hop=512,win=1024,n=Math.floor((s1-s0-win)/hop);
@@ -1306,27 +1385,27 @@ function estimateBpm(L,R,s0,s1){
   }
   return bl?Math.round(60*fps/bl):null;
 }
-async function transcribe(){
+async function transcribe(k){
   try{
     gStatus('Loading the note finder...');gProg(null);await tick();
     var mod=await import(BP_URL);
     var pick=function(n){return mod[n]||(mod.default&&mod.default[n]);};
     var BPc=pick('BasicPitch'),f1=pick('outputToNotesPoly'),f2=pick('addPitchBendsToNoteEvents'),f3=pick('noteFramesToTime');
     if(!BPc||!f1||!f3)throw new Error('the note finder library has an unexpected shape');
-    var m=G.stem,total=m.s1-m.s0,n=Math.floor(total/2),mono=new Float32Array(n),last=m.L.length-1;
+    var sl_=G.st.L[k],sr_=G.st.R[k],n=Math.floor(sl_.length/2),mono=new Float32Array(n),last=sl_.length-1;
     for(var i=0;i<n;i++){
-      var a=2*i+m.s0,p=a>0?a-1:a,q=a<last?a+1:a;
-      mono[i]=((m.L[p]+m.R[p])+2*(m.L[a]+m.R[a])+(m.L[q]+m.R[q]))/8;
+      var a=2*i,p=a>0?a-1:a,q=a<last?a+1:a;
+      mono[i]=((sl_[p]+sr_[p])+2*(sl_[a]+sr_[a])+(sl_[q]+sr_[q]))/8;
     }
     var bp=new BPc(BP_MODEL),frames=[],onsets=[],contours=[];
     await bp.evaluateModel(mono,function(f,o,c){
-      for(var k=0;k<f.length;k++){frames.push(f[k]);onsets.push(o[k]);contours.push(c[k]);}
+      for(var j=0;j<f.length;j++){frames.push(f[j]);onsets.push(o[j]);contours.push(c[j]);}
     },function(pc){var pr=pc>1?pc/100:pc;gProg(pr);gStatus('Finding notes: '+Math.round(pr*100)+'%');});
-    G.bp={frames:frames,onsets:onsets,contours:contours,f1:f1,f2:f2,f3:f3};
+    G.bp={track:k,frames:frames,onsets:onsets,contours:contours,f1:f1,f2:f2,f3:f3};
     return true;
   }catch(e){
     console.error(e);
-    gStatus('The guitar stem is ready, but the note finder failed: '+e.message);
+    gStatus('The instruments are split, but the note finder failed: '+e.message);
     return false;
   }
 }
@@ -1402,11 +1481,19 @@ function buildTab(notes,bpm,spb){
   seq.forEach(function(el,i){chosen[i].forEach(function(x){cols[el.k].n[x[0]]=String(x[1]);});});
   return cols;
 }
-function rebuildTab(){
-  if(!G.bp||!cur){toast('Generate a tab first.');return;}
+async function rebuildTab(){
+  if(!G.st||!cur){toast('Generate a tab first.');return;}
+  var trk=+$('#gTrack').value;
+  if(!G.bp||G.bp.track!==trk){
+    if(G.busy){toast('Wait for the current run to finish.');return;}
+    G.busy=true;busyUI(true);
+    var ok=await transcribe(trk);
+    G.busy=false;busyUI(false);gProg(null);
+    if(!ok)return;
+  }
   var spb=+$('#gGrid').value,bpm=clamp(Math.round(+$('#gBpm').value||G.bpm||cur.bpm),30,260);
   var cols=buildTab(notesFrom(G.bp,$('#gSens').value),bpm,spb);
-  if(!cols){gStatus('No usable guitar notes were found. Try "More" under Notes.');return;}
+  if(!cols){gStatus('No usable notes were found on that track. Try More under Notes, or another track.');return;}
   pushUndo(true);
   cur.cols=($('#gMode').value==='append')?cur.cols.concat(cols):cols;
   cur.bpm=bpm;$('#bpm').value=bpm;
@@ -1428,18 +1515,32 @@ function wavBlob(L,R){
   }
   return new Blob([buf],{type:'audio/wav'});
 }
+var STEM_NAMES=['Drums','Bass','Other','Vocals','Guitar','Piano'];
+function buildSources(){
+  var h='<button type="button" data-src="orig" class="on">Original</button>';
+  [4,5,3,0,1,2].forEach(function(i){h+='<button type="button" data-src="s'+i+'">'+STEM_NAMES[i]+' only</button>';});
+  h+='<button type="button" data-src="bak">No guitar</button>';
+  var el=$('#gSources');el.innerHTML=h;el.hidden=false;
+}
+function stemFull(i){
+  var st=G.st,L=new Float32Array(st.len),R=new Float32Array(st.len);
+  L.set(st.L[i],st.s0);R.set(st.R[i],st.s0);
+  return [L,R];
+}
 function setSource(k){
-  if(!G.stem||!G.mix)return;
+  if(!G.st||!G.mix)return;
   var url;
   if(k==='orig')url=G.origUrl;
-  else if(k==='gtr'){if(!G.urls.gtr)G.urls.gtr=wavURL(G.stem.L,G.stem.R);url=G.urls.gtr;}
-  else{
+  else if(k==='bak'){
     if(!G.urls.bak){
-      var n=G.mix.len,bl=new Float32Array(n),br=new Float32Array(n);
-      for(var i=0;i<n;i++){bl[i]=G.mix.L[i]-G.stem.L[i];br[i]=G.mix.R[i]-G.stem.R[i];}
+      var g=stemFull(4),n=G.mix.len,bl=new Float32Array(n),br=new Float32Array(n);
+      for(var i=0;i<n;i++){bl[i]=G.mix.L[i]-g[0][i];br[i]=G.mix.R[i]-g[1][i];}
       G.urls.bak=wavURL(bl,br);
     }
     url=G.urls.bak;
+  }else{
+    if(!G.urls[k]){var f=stemFull(+k.slice(1));G.urls[k]=wavURL(f[0],f[1]);}
+    url=G.urls[k];
   }
   if(!url)return;
   var t=A.currentTime,was=!A.paused;
@@ -1449,8 +1550,8 @@ function setSource(k){
 }
 async function generate(){
   if(G.busy)return;
-  if(!G.file){toast('Record or load the song audio first.');return;}
-  var engine=$('#gEngine').value,range=$('#gRange').value;
+  if(!G.file){toast('Get the song audio first.');return;}
+  var engine=$('#gEngine').value,range=$('#gRange').value,trk=+$('#gTrack').value;
   if(range==='ab'&&!(ab.a!=null&&ab.b!=null&&ab.b>ab.a)){toast('Set points A and B on the audio first.');return;}
   var songId=cur.id;
   G.busy=true;G.cancel=false;G.engine=engine;busyUI(true);
@@ -1460,17 +1561,29 @@ async function generate(){
     var L=decoded.getChannelData(0),R=decoded.numberOfChannels>1?decoded.getChannelData(1):L;
     var len=L.length,s0=0,s1=len;
     if(range==='ab'){s0=clamp(Math.floor(ab.a*SR),0,len-1);s1=clamp(Math.ceil(ab.b*SR),Math.min(len,s0+SR),len);}
-    G.mix={L:L,R:R,len:len};G.bp=null;
-    await startEngine(engine);
-    var g=await separate(L,R,s0,s1);
-    G.stem={L:g.L,R:g.R,s0:s0,s1:s1};
-    $('#gSources').hidden=false;
-    $$('#gSources button').forEach(function(b){b.classList.toggle('on',b.dataset.src==='orig');});
-    gStatus('Finding the tempo...');gProg(null);await tick();
+    G.mix={L:L,R:R,len:len};G.bp=null;G.st=null;
+    var g=null;
+    if(engine==='auto'||engine==='helper'){
+      var hp=await helperPing();
+      if(hp&&hp.separate){
+        try{g=await separateViaHelper(L,R,s0,s1);}
+        catch(e){
+          if(String(e.message)==='cancelled'||engine==='helper')throw e;
+          console.error(e);gStatus('The helper could not split it ('+e.message+'). Using the browser instead...');await tick();
+        }
+      }else if(engine==='helper')throw new Error('the helper is not running, or it lacks the splitting parts (pip install numpy onnxruntime-directml)');
+    }
+    if(!g){
+      await startEngine(engine==='helper'?'auto':engine);
+      g=await separate(L,R,s0,s1);
+    }
+    G.st={L:g.L,R:g.R,s0:s0,s1:s1,len:len};
+    buildSources();
+    gStatus((g.info?g.info+' ':'')+'Finding the tempo...');gProg(null);await tick();
     G.bpm=estimateBpm(L,R,s0,s1)||(cur?cur.bpm:90);
     $('#gBpm').placeholder='auto ('+G.bpm+')';
-    var ok=await transcribe();
-    if(ok&&cur&&cur.id===songId)rebuildTab();
+    var ok=await transcribe(trk);
+    if(ok&&cur&&cur.id===songId)await rebuildTab();
     else if(ok)gStatus('Done, but you left the song before the tab was placed.');
   }catch(e){
     if(String(e.message)==='cancelled')gStatus('Cancelled.');
@@ -1570,13 +1683,15 @@ function bind(){
   $('#aClear').addEventListener('click',function(){ab={a:null,b:null,on:false};abText();$('#aLoop').setAttribute('aria-pressed','false');});
   $('#aFocus').addEventListener('change',function(){wireA();applyFocus();});
   $('#aRec').addEventListener('click',recToggle);
+  $('#aLink').addEventListener('click',function(){helperFetch(false);});
+  $('#autoFetch').addEventListener('change',function(e){db.prefs.autoFetch=e.target.checked;save();});
   $('#aDrop').addEventListener('click',function(){
     audioDel(cur.id);stopA();resetGen();A.removeAttribute('src');
     $('#aName').textContent='No audio yet';$('#aPlay').disabled=true;$('#aSeek').disabled=true;$('#aDrop').hidden=true;
     $('#aTime').textContent='0:00 / 0:00';toast('Saved audio removed.');
   });
   $('#gGo').addEventListener('click',generate);
-  $('#gCancel').addEventListener('click',function(){G.cancel=true;gStatus('Cancelling...');killWorker();});
+  $('#gCancel').addEventListener('click',function(){G.cancel=true;gStatus('Cancelling...');killWorker();if(G.hAbort)G.hAbort.abort();});
   $('#gRebuild').addEventListener('click',function(){rebuildTab();});
   $('#gSources').addEventListener('click',function(e){var b=e.target.closest('[data-src]');if(b)setSource(b.dataset.src);});
 
