@@ -289,7 +289,7 @@ label.fileb{cursor:pointer}
             </div>
             <div class="audio gen" id="genBox">
               <h3>Generate guitar stem and tab</h3>
-              <p class="hint">Runs entirely in this browser: the Demucs model splits out the guitar, then a note finder turns it into a rough tab. Record or load the song's audio above first. The first run downloads the model (130 to 290 MB) and keeps it for next time.</p>
+              <p class="hint">Runs entirely in this browser: the Demucs model splits out the guitar, then a note finder turns it into a rough tab. Record or load the song's audio above first. The first run downloads the model (about 285 MB) and keeps it for next time. Starting the engine can take a minute or two, and it runs in the background so the page stays usable.</p>
               <div class="row">
                 <label class="small">Engine <select id="gEngine"><option value="auto">Auto</option><option value="webgpu">GPU</option><option value="wasm">CPU only</option></select></label>
                 <label class="small">Section <select id="gRange"><option value="all">Whole song</option><option value="ab">Only the A-B section</option></select></label>
@@ -1134,12 +1134,9 @@ async function recDone(){
 var ORT_BASE='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
 var BP_URL='https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/+esm';
 var BP_MODEL='https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json';
-var MODELS={
-  gpu:'https://huggingface.co/kramp/htdemucs-6s-webgpu-onnx/resolve/main/htdemucs_6s.onnx',
-  cpu:'https://huggingface.co/StemSplitio/htdemucs-6s-onnx/resolve/main/htdemucs_6s_fp16weights.onnx'
-};
+var MODELS={gpu:'https://huggingface.co/kramp/htdemucs-6s-webgpu-onnx/resolve/main/htdemucs_6s.onnx'};
 var SR=44100,SEG=343980;
-var G={file:null,origUrl:'',busy:false,cancel:false,engine:'auto',sess:null,kind:'',mix:null,stem:null,bp:null,bpm:null,urls:{}};
+var G={file:null,origUrl:'',busy:false,cancel:false,engine:'auto',worker:null,pend:null,kind:'',mix:null,stem:null,bp:null,bpm:null,urls:{}};
 function gStatus(t){var e=$('#gStatus');if(e)e.textContent=t;}
 function gProg(p){var w=$('#gBarWrap');if(!w)return;w.hidden=(p==null);if(p!=null)$('#gBar').style.width=Math.round(clamp(p,0,1)*100)+'%';}
 function tick(){return new Promise(function(r){setTimeout(r,0);});}
@@ -1182,69 +1179,105 @@ function fetchModel(url,label){
     return new Uint8Array(await blob.arrayBuffer());
   })();
 }
-async function wasmSession(){
-  ort.env.wasm.numThreads=self.crossOriginIsolated?Math.min(4,navigator.hardwareConcurrency||2):1;
-  ort.env.wasm.proxy=true;
-  var b=await fetchModel(MODELS.cpu,'CPU model');
-  gStatus('Starting the CPU engine...');
-  G.sess=await ort.InferenceSession.create(b,{executionProviders:['wasm']});
-  G.kind='wasm';
-}
-async function getSession(engine){
-  if(!window.ort)await loadScript(ORT_BASE+'ort.webgpu.min.js');
-  ort.env.wasm.wasmPaths=ORT_BASE;
-  if(G.sess&&(engine==='auto'||engine===(G.kind==='webgpu'?'webgpu':'wasm')))return;
-  G.sess=null;
-  var gpu=(engine==='webgpu')||(engine==='auto'&&!!navigator.gpu);
-  if(gpu){
+function workerMain(){
+  var ort=null,sess=null;
+  self.onmessage=async function(e){
+    var m=e.data;
     try{
-      var b=await fetchModel(MODELS.gpu,'GPU model');
-      gStatus('Starting the GPU engine...');
-      G.sess=await ort.InferenceSession.create(b,{executionProviders:['webgpu'],graphOptimizationLevel:'basic'});
-      G.kind='webgpu';return;
+      if(m.type==='init'){
+        var mod=await import(m.base+'ort.webgpu.min.mjs');
+        ort=mod.InferenceSession?mod:mod.default;
+        ort.env.wasm.wasmPaths=m.base;
+        ort.env.wasm.numThreads=m.threads;
+        sess=await ort.InferenceSession.create(m.model,{executionProviders:[m.ep],graphOptimizationLevel:'basic'});
+        self.postMessage({type:'ready'});
+      }else if(m.type==='run'){
+        var feeds={};feeds[sess.inputNames[0]]=new ort.Tensor('float32',m.data,[1,2,m.N]);
+        var r=await sess.run(feeds),o=r[sess.outputNames[0]],dims=o.dims;
+        if(!dims||dims.length<4||dims[1]<6){self.postMessage({type:'error',msg:'This model has no guitar stem.'});return;}
+        var d=o.data,N=m.N,base=4*2*N,out=new Float32Array(2*N);
+        out.set(d.subarray(base,base+2*N));
+        if(o.dispose)o.dispose();
+        self.postMessage({type:'done',out:out},[out.buffer]);
+      }
+    }catch(err){self.postMessage({type:'error',msg:String((err&&err.message)||err)});}
+  };
+}
+function killWorker(){
+  if(G.worker){try{G.worker.terminate();}catch(e){}G.worker=null;}
+  if(G.pend)G.pend(new Error('cancelled'));
+}
+function wcall(msg,transfer,label,timeoutMs){
+  return new Promise(function(res,rej){
+    var w=G.worker;
+    if(!w){rej(new Error('cancelled'));return;}
+    var t0=Date.now(),done=false,to=0;
+    var iv=setInterval(function(){gStatus(label+' ('+Math.round((Date.now()-t0)/1000)+' s)');},1000);
+    function fin(err,val){if(done)return;done=true;clearInterval(iv);clearTimeout(to);G.pend=null;if(err)rej(err);else res(val);}
+    if(timeoutMs)to=setTimeout(function(){fin(new Error('no answer after '+Math.round(timeoutMs/1000)+' s'));},timeoutMs);
+    G.pend=fin;
+    gStatus(label+' (0 s)');
+    w.postMessage(msg,transfer||[]);
+  });
+}
+async function startEngine(engine){
+  var gpuWanted=(engine==='webgpu')||(engine==='auto'&&!!navigator.gpu);
+  var want=gpuWanted?'webgpu':'wasm';
+  if(G.worker&&(engine==='auto'||G.kind===want))return;
+  killWorker();
+  var tries=(gpuWanted&&engine==='auto')?['webgpu','wasm']:[want],lastErr=null;
+  for(var k=0;k<tries.length;k++){
+    var ep=tries[k];
+    try{
+      var model=await fetchModel(MODELS.gpu,'model');
+      gProg(null);
+      var url=URL.createObjectURL(new Blob(['('+workerMain.toString()+')()'],{type:'text/javascript'}));
+      var w=new Worker(url);
+      G.worker=w;G.kind=ep;
+      w.onmessage=function(e){var m=e.data;if(!G.pend)return;if(m.type==='error')G.pend(new Error(m.msg));else G.pend(null,m);};
+      w.onerror=function(e){if(G.pend)G.pend(new Error('the engine could not load'+(e&&e.message?': '+e.message:'')));};
+      await wcall({type:'init',base:ORT_BASE,ep:ep,model:model,threads:self.crossOriginIsolated?Math.min(4,navigator.hardwareConcurrency||2):1},[model.buffer],
+        'Starting the '+(ep==='webgpu'?'GPU':'CPU')+' engine, this can take a minute or two',ep==='webgpu'?180000:420000);
+      return;
     }catch(e){
-      if(String(e.message)==='cancelled'||engine==='webgpu')throw e;
-      gStatus('The GPU engine would not start, using the CPU instead...');
+      killWorker();
+      if(String(e.message)==='cancelled')throw e;
+      lastErr=e;console.error(e);
+      if(k<tries.length-1)gStatus('The GPU engine did not start ('+e.message+'). Trying the CPU instead...');
     }
   }
-  await wasmSession();
-}
-async function runChunk(inp,N){
-  var sess=G.sess,feeds={};
-  feeds[sess.inputNames[0]]=new ort.Tensor('float32',inp.slice(),[1,2,N]);
-  var res=await sess.run(feeds);
-  return res[sess.outputNames[0]];
+  throw lastErr;
 }
 async function separate(L,R,s0,s1){
   var N=SEG,ov=Math.floor(N/4),stride=N-ov,total=s1-s0,nCh=Math.max(1,Math.ceil((total-ov)/stride));
   var accL=new Float32Array(total),accR=new Float32Array(total),wsum=new Float32Array(total);
   var win=new Float32Array(N);
   for(var j=0;j<N;j++)win[j]=Math.min(1,(j+1)/ov,(N-j)/ov);
-  var inp=new Float32Array(2*N),t0=performance.now();
+  var inp=new Float32Array(2*N),t0=performance.now(),left=0;
   for(var i=0;i<nCh;i++){
     if(G.cancel)throw new Error('cancelled');
     var p=i*stride,len=Math.min(N,total-p);
     inp.fill(0);
     inp.set(L.subarray(s0+p,s0+p+len),0);inp.set(R.subarray(s0+p,s0+p+len),N);
-    var out;
-    try{out=await runChunk(inp,N);}
-    catch(e){
-      if(i===0&&G.kind==='webgpu'&&G.engine==='auto'){
-        gStatus('The GPU run failed, switching to the CPU...');
-        await wasmSession();out=await runChunk(inp,N);
+    var label='Splitting out the guitar: segment '+(i+1)+' of '+nCh+(i>0?', about '+fmt(left)+' left':''),res;
+    try{
+      var cp=inp.slice();
+      res=await wcall({type:'run',N:N,data:cp},[cp.buffer],label,0);
+    }catch(e){
+      if(i===0&&G.kind==='webgpu'&&G.engine==='auto'&&String(e.message)!=='cancelled'){
+        gStatus('The GPU run failed ('+e.message+'). Switching to the CPU...');
+        await startEngine('wasm');
+        var cp2=inp.slice();
+        res=await wcall({type:'run',N:N,data:cp2},[cp2.buffer],label,0);
       }else throw e;
     }
-    var dims=out.dims;
-    if(!dims||dims.length<4||dims[1]<6)throw new Error('This model has no guitar stem.');
-    var d=out.data,base=4*2*N;
+    var d=res.out;
     for(var k=0;k<len;k++){
       var w=win[k];
-      accL[p+k]+=d[base+k]*w;accR[p+k]+=d[base+N+k]*w;wsum[p+k]+=w;
+      accL[p+k]+=d[k]*w;accR[p+k]+=d[N+k]*w;wsum[p+k]+=w;
     }
-    if(out.dispose)out.dispose();
-    var el=(performance.now()-t0)/1000,left=el/(i+1)*(nCh-i-1);
+    var el=(performance.now()-t0)/1000;left=el/(i+1)*(nCh-i-1);
     gProg((i+1)/nCh);
-    gStatus('Splitting out the guitar: segment '+(i+1)+' of '+nCh+(i>0?', about '+fmt(left)+' left':''));
     await tick();
   }
   var gl=new Float32Array(L.length),gr=new Float32Array(L.length);
@@ -1428,7 +1461,7 @@ async function generate(){
     var len=L.length,s0=0,s1=len;
     if(range==='ab'){s0=clamp(Math.floor(ab.a*SR),0,len-1);s1=clamp(Math.ceil(ab.b*SR),Math.min(len,s0+SR),len);}
     G.mix={L:L,R:R,len:len};G.bp=null;
-    await getSession(engine);
+    await startEngine(engine);
     var g=await separate(L,R,s0,s1);
     G.stem={L:g.L,R:g.R,s0:s0,s1:s1};
     $('#gSources').hidden=false;
@@ -1543,7 +1576,7 @@ function bind(){
     $('#aTime').textContent='0:00 / 0:00';toast('Saved audio removed.');
   });
   $('#gGo').addEventListener('click',generate);
-  $('#gCancel').addEventListener('click',function(){G.cancel=true;gStatus('Cancelling...');});
+  $('#gCancel').addEventListener('click',function(){G.cancel=true;gStatus('Cancelling...');killWorker();});
   $('#gRebuild').addEventListener('click',function(){rebuildTab();});
   $('#gSources').addEventListener('click',function(e){var b=e.target.closest('[data-src]');if(b)setSource(b.dataset.src);});
 
